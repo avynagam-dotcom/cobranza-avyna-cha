@@ -344,11 +344,21 @@ app.post("/api/upload", upload.single("pdf"), async (req, res) => {
         String(n.originalName || "").toLowerCase() === String(originalName).toLowerCase()
     );
 
-    // Parse PDF (siempre parseamos porque para sustituir necesitamos nuevo total/cliente)
-    const parsed = await pdfParse(req.file.buffer);
-    const text = parsed && parsed.text ? parsed.text : "";
-    const cliente = extractClienteFromText(text) || null;
-    const total = extractTotalFromText(text);
+    // Parse PDF (Modo Seguro para Notas Complejas)
+    let text = "";
+    let cliente = null;
+    let total = null;
+
+    try {
+      const parsed = await pdfParse(req.file.buffer);
+      text = parsed && parsed.text ? parsed.text : "";
+      cliente = extractClienteFromText(text);
+      total = extractTotalFromText(text);
+    } catch (parseErr) {
+      console.error("[Parse] Error leyendo PDF complejo, procediendo con datos nulos:", parseErr.message);
+      // No lanzamos error, dejamos que el usuario lo llene manual
+    }
+
     const uploadedAt = new Date().toISOString();
 
     if (existingIdx !== -1) {
