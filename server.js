@@ -175,18 +175,6 @@ function parseMoney(raw) {
 }
 
 function extractTotalFromText(text) {
-  // ✅ Regla Especial: NOTA DE VENTA MENUDEO (Prioridad)
-  if (/nota de venta/i.test(text)) {
-    // Buscamos la ÚLTIMA ocurrencia de TOTAL seguida de un precio
-    // Esto evita capturar Subtotales o totales de partidas individuales
-    const matches = [...text.matchAll(/TOTAL[\s\S]{0,50}?\$?\s*([0-9][0-9.,\s]{1,})/gi)];
-    if (matches.length > 0) {
-      const lastMatch = matches[matches.length - 1];
-      const val = parseMoney(lastMatch[1]);
-      if (val != null) return val;
-    }
-  }
-
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 
   // líneas con TOTAL pero NO SUBTOTAL
@@ -231,13 +219,6 @@ function extractTotalFromText(text) {
 }
 
 function extractClienteFromText(text) {
-  // ✅ Regla Especial: NOTA DE VENTA (Prioridad)
-  if (/nota de venta/i.test(text)) {
-    // Buscamos CLIENTE y capturamos hasta el final de la línea o un separador de campo
-    const m = text.match(/CLIENTE\s*[:\-]?\s*(.+?)(?=\r|\n|FOLIO|FECHA|DIREC|TEL|$)/im);
-    if (m && m[1]) return m[1].trim();
-  }
-
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 
   const sameLine = [
@@ -348,20 +329,11 @@ app.post("/api/upload", upload.single("pdf"), async (req, res) => {
         String(n.originalName || "").toLowerCase() === String(originalName).toLowerCase()
     );
 
-    // Parse PDF (Modo Seguro para Notas Complejas)
-    let text = "";
-    let cliente = null;
-    let total = null;
-
-    try {
-      const parsed = await pdfParse(req.file.buffer);
-      text = parsed && parsed.text ? parsed.text : "";
-      cliente = extractClienteFromText(text);
-      total = extractTotalFromText(text);
-    } catch (parseErr) {
-      console.error("[Parse] Error leyendo PDF complejo, procediendo con datos nulos:", parseErr.message);
-      // No lanzamos error, dejamos que el usuario lo llene manual
-    }
+    // Parse PDF (siempre parseamos porque para sustituir necesitamos nuevo total/cliente)
+    const parsed = await pdfParse(req.file.buffer);
+    const text = parsed && parsed.text ? parsed.text : "";
+    const cliente = extractClienteFromText(text) || null;
+    const total = extractTotalFromText(text);
 
     const uploadedAt = new Date().toISOString();
 
