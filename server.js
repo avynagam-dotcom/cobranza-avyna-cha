@@ -176,11 +176,13 @@ function parseMoney(raw) {
 
 function extractTotalFromText(text) {
   // ✅ Regla Especial: NOTA DE VENTA MENUDEO (Prioridad)
-  if (/nota de venta menudeo/i.test(text)) {
-    // Buscamos TOTAL y el número que le siga, permitiendo saltos de línea y caracteres raros
-    const m = text.match(/TOTAL\s*[:\-]?\s*[\$\s]*([0-9][0-9.,\s]*)/i);
-    if (m) {
-      const val = parseMoney(m[1]);
+  if (/nota de venta/i.test(text)) {
+    // Buscamos la ÚLTIMA ocurrencia de TOTAL seguida de un precio
+    // Esto evita capturar Subtotales o totales de partidas individuales
+    const matches = [...text.matchAll(/TOTAL[\s\S]{0,50}?\$?\s*([0-9][0-9.,\s]{1,})/gi)];
+    if (matches.length > 0) {
+      const lastMatch = matches[matches.length - 1];
+      const val = parseMoney(lastMatch[1]);
       if (val != null) return val;
     }
   }
@@ -229,10 +231,10 @@ function extractTotalFromText(text) {
 }
 
 function extractClienteFromText(text) {
-  // ✅ Regla Especial: NOTA DE VENTA MENUDEO (Prioridad)
-  if (/nota de venta menudeo/i.test(text)) {
-    // Buscamos CLIENTE y capturamos hasta el final de la línea o un separador
-    const m = text.match(/CLIENTE\s*[:\-]?\s*(.+?)(?=\r|\n|FOLIO|FECHA|$)/im);
+  // ✅ Regla Especial: NOTA DE VENTA (Prioridad)
+  if (/nota de venta/i.test(text)) {
+    // Buscamos CLIENTE y capturamos hasta el final de la línea o un separador de campo
+    const m = text.match(/CLIENTE\s*[:\-]?\s*(.+?)(?=\r|\n|FOLIO|FECHA|DIREC|TEL|$)/im);
     if (m && m[1]) return m[1].trim();
   }
 
