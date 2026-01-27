@@ -175,6 +175,15 @@ function parseMoney(raw) {
 }
 
 function extractTotalFromText(text) {
+  // ✅ Regla Especial: NOTA DE VENTA MENUDEO (Prioridad)
+  if (text.includes("NOTA DE VENTA MENUDEO")) {
+    const m = text.match(/TOTAL:\s*[:\-]?\s*\$?\s*([0-9][0-9.,\s]*)/i);
+    if (m) {
+      const val = parseMoney(m[1]);
+      if (val != null) return val;
+    }
+  }
+
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 
   // líneas con TOTAL pero NO SUBTOTAL
@@ -219,6 +228,12 @@ function extractTotalFromText(text) {
 }
 
 function extractClienteFromText(text) {
+  // ✅ Regla Especial: NOTA DE VENTA MENUDEO (Prioridad)
+  if (text.includes("NOTA DE VENTA MENUDEO")) {
+    const m = text.match(/CLIENTE:\s*[:\-]?\s*(.+)$/im);
+    if (m && m[1]) return m[1].trim();
+  }
+
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 
   const sameLine = [
