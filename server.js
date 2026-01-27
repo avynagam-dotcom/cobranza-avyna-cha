@@ -177,7 +177,8 @@ function parseMoney(raw) {
 function extractTotalFromText(text) {
   // ✅ Regla Especial: NOTA DE VENTA MENUDEO (Prioridad)
   if (/nota de venta menudeo/i.test(text)) {
-    const m = text.match(/TOTAL\s*[:\-]?\s*\$?\s*([0-9][0-9.,\s]*)/i);
+    // Buscamos TOTAL y el número que le siga, permitiendo saltos de línea y caracteres raros
+    const m = text.match(/TOTAL\s*[:\-]?\s*[\$\s]*([0-9][0-9.,\s]*)/i);
     if (m) {
       const val = parseMoney(m[1]);
       if (val != null) return val;
@@ -230,7 +231,8 @@ function extractTotalFromText(text) {
 function extractClienteFromText(text) {
   // ✅ Regla Especial: NOTA DE VENTA MENUDEO (Prioridad)
   if (/nota de venta menudeo/i.test(text)) {
-    const m = text.match(/CLIENTE\s*[:\-]?\s*(.+)$/im);
+    // Buscamos CLIENTE y capturamos hasta el final de la línea o un separador
+    const m = text.match(/CLIENTE\s*[:\-]?\s*(.+?)(?=\r|\n|FOLIO|FECHA|$)/im);
     if (m && m[1]) return m[1].trim();
   }
 
