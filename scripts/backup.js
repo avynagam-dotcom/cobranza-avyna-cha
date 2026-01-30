@@ -16,57 +16,36 @@ async function runBackup() {
     const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
     const R2_BUCKET = process.env.R2_BUCKET;
 
-    // Carpeta de datos a respaldar (específica para CHA)
-    const DATA_DIR = "/var/data/cobranza-cha";
+    // Configuration via Environment (Defaults matching server.js logic)
+    // El usuario define process.env.DATA_DIR (ej: /var/data/cobranza/cha)
+    const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "..", "data");
 
-    // Si no existe el disco persistente, intentamos la local (desarrollo/fallback)
-    let SOURCE_DIR;
-    if (fs.existsSync(DATA_DIR)) {
-        console.log(`[INFO] Detectado disco persistente en: ${DATA_DIR}`);
-        SOURCE_DIR = DATA_DIR;
-    } else {
-        console.log(`[WARN] No se detectó disco persistente. Usando ruta local relativa.`);
-        SOURCE_DIR = path.join(__dirname, "..");
-    }
+    // Uploads está dentro o hermano? En server.js definimos: UPLOADS_DIR = path.join(DATA_DIR, "uploads")
+    // Pero si DATA_DIR es .../cha, server.js hace Data: .../cha (DB_FILE) y Uploads: .../cha/uploads
+    // Ajustemos backup para que busque ahí.
+    const SOURCE_DIR = DATA_DIR;
 
     if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
         throw new Error("❌ Faltan variables de entorno CRÍTICAS para el backup (R2)");
     }
 
     const date = new Date().toISOString().split("T")[0];
-    // Prefijo "cha-" solicitado para diferenciar
-    const filename = `cha-backup-${date}.tar.gz`;
+    const filename = `backup-${date}.tar.gz`; // Quitamos 'cha-' del nombre, lo pondremos en carpeta
     const archivePath = path.join("/tmp", filename);
 
     try {
-        console.log(`\n🔍 Verificando carpetas origen en: ${SOURCE_DIR}`);
+        console.log(`\n🔍 Verificando origen en: ${SOURCE_DIR}`);
+        // server.js pone notas.json en raíz de DATA_DIR y uploads en DATA_DIR/uploads.
+        // Así que respaldaremos todo el SOURCE_DIR.
 
-        const targets = [];
-        const dataPath = path.join(SOURCE_DIR, "data");
-        const uploadsPath = path.join(SOURCE_DIR, "uploads");
-
-        if (fs.existsSync(dataPath)) {
-            console.log("   ✅ Encontrado: /data");
-            targets.push("data");
-        } else {
-            console.log("   ⚠️ FALTANTE: /data");
-        }
-
-        if (fs.existsSync(uploadsPath)) {
-            console.log("   ✅ Encontrado: /uploads");
-            targets.push("uploads");
-        } else {
-            console.log("   ⚠️ FALTANTE: /uploads");
-        }
-
-        if (targets.length === 0) {
-            console.warn("⚠️ ALERTA: No hay nada que respaldar (ni data ni uploads). Abortando.");
+        if (!fs.existsSync(SOURCE_DIR)) {
+            console.warn(`⚠️ ALERTA: No existe el directorio origen: ${SOURCE_DIR}`);
             return;
         }
 
-        console.log(`\n📦 Comprimiendo archivos en ${archivePath}...`);
-        // Usamos cwd: SOURCE_DIR para que el tar contenga "data/..." y "uploads/..." limpios
-        execSync(`tar -czf ${archivePath} ${targets.join(" ")}`, { cwd: SOURCE_DIR });
+        console.log(`\n📦 Comprimiendo contenido de ${SOURCE_DIR} en ${archivePath}...`);
+        // Tar de todo el contenido de DATA_DIR (.)
+        execSync(`tar -czf ${archivePath} .`, { cwd: SOURCE_DIR });
 
         const sizeBytes = fs.statSync(archivePath).size;
         const sizeMB = (sizeBytes / (1024 * 1024)).toFixed(2);
@@ -83,7 +62,8 @@ async function runBackup() {
         });
 
         const fileBuffer = fs.readFileSync(archivePath);
-        const s3Key = `${SYSTEM_NAME}/${filename}`;
+        // Prefijo solicitado: "cha/..."
+        const s3Key = `cha/${filename}`;
 
         await s3.send(new PutObjectCommand({
             Bucket: R2_BUCKET,

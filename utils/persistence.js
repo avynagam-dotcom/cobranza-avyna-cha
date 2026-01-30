@@ -3,29 +3,33 @@
 const fs = require("fs");
 const path = require("path");
 
-// Definimos la ruta base para auditoría de forma centralizada para este sistema (CHA)
-// Se usará esta ruta si existe el disco persistente, de lo contrario fallback a local.
-const RENDER_DISK_PATH = "/var/data/cobranza-cha";
-const AUDIT_FILE_NAME = "audit.jsonl";
+// Configuration: Always prefer process.env.DATA_DIR
+// If not set, fallback to local ./data
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
+const AUDIT_FILE = path.join(DATA_DIR, "audit.jsonl");
 
-function getAuditPath() {
-  if (fs.existsSync(RENDER_DISK_PATH)) {
-    return path.join(RENDER_DISK_PATH, "data", AUDIT_FILE_NAME);
+function ensureDirExists(filePath) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {
+      console.error(`[Persistence] Error creando directorio ${dir}:`, e.message);
+    }
   }
-  // En local (dev) guardamos en data/audit.jsonl relativo al root
-  return path.join(process.cwd(), "data", AUDIT_FILE_NAME);
 }
 
 function appendAuditLog(operation, details) {
   try {
-    const auditFile = getAuditPath();
+    ensureDirExists(AUDIT_FILE);
+
     const entry = JSON.stringify({
       timestamp: new Date().toISOString(),
       operation,
       details,
     });
     // Append (a)
-    fs.appendFileSync(auditFile, entry + "\n", "utf8");
+    fs.appendFileSync(AUDIT_FILE, entry + "\n", "utf8");
   } catch (err) {
     console.error(`[Audit] Error escribiendo log: ${err.message}`);
   }
@@ -41,7 +45,10 @@ function atomicWrite(filePath, data) {
 
   try {
     const jsonString = JSON.stringify(data, null, 2);
-    
+
+    // Asegurar que el directorio destino existe
+    ensureDirExists(tmpPath);
+
     // 1. Escribir en .tmp
     fs.writeFileSync(tmpPath, jsonString, "utf8");
 
@@ -58,16 +65,14 @@ function atomicWrite(filePath, data) {
     const filename = path.basename(filePath);
     appendAuditLog("SAVE_FILE", { filename, size: stats.size });
 
-    // console.log(`[Persistence] Guardado exitoso: ${filename} (${stats.size} bytes)`);
-
   } catch (err) {
     console.error(`[Persistence] CRITICAL ERROR guardando ${filePath}:`, err);
     // Intentar borrar el tmp si quedó corrupto o falló el proceso
     if (fs.existsSync(tmpPath)) {
       try { fs.unlinkSync(tmpPath); } catch (e) { /* ignore */ }
     }
-    throw err; // Re-lanzar para que quien llame sepa que falló
+    throw err;
   }
 }
 
-module.exports = { atomicWrite };
+module.exports = { atomicWrite, DATA_DIR };

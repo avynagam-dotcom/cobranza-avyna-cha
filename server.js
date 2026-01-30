@@ -13,26 +13,22 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 // ----- Paths
-// ----- Paths configuration (Render Persistent Disk Support)
+// ----- Paths configuration (Robust & Simple)
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
 
-// Detectar Persistent Disk de Render
-const RENDER_DISK_PATH = "/var/data/cobranza-cha";
-// Usamos el disco solo si existe físicamente
-const USE_PERSISTENT = fs.existsSync(RENDER_DISK_PATH);
+// El usuario define process.env.DATA_DIR en Render (ej: /var/data/cobranza/cha)
+// Si no, fallback local.
+const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, "data");
+const UPLOADS_DIR = path.join(DATA_DIR, "uploads"); // Uploads DENTRO de data, o hermano? 
+// Nota: El código anterior ponía uploads fuera de data en Persistent mode user-defined? 
+// Revisando lógica anterior: DATA_DIR = path.join(RENDER_DISK_PATH, "data"); UPLOADS_DIR = path.join(RENDER_DISK_PATH, "uploads");
+// Si process.env.DATA_DIR es "/var/data/cobranza/cha", entonces:
+// Data real: /var/data/cobranza/cha
+// Uploads: /var/data/cobranza/cha/uploads
+// Esto parece lo más sensato para mantener todo junto.
 
-let DATA_DIR, UPLOADS_DIR;
-
-if (USE_PERSISTENT) {
-  console.log(`[System] Usando Persistent Disk en: ${RENDER_DISK_PATH}`);
-  DATA_DIR = path.join(RENDER_DISK_PATH, "data");
-  UPLOADS_DIR = path.join(RENDER_DISK_PATH, "uploads");
-} else {
-  console.log(`[System] Usando almacenamiento local (ephemeral/local)`);
-  DATA_DIR = process.env.DATA_DIR || path.join(ROOT, "data");
-  UPLOADS_DIR = path.join(ROOT, "uploads");
-}
+console.log(`[System] DATA_DIR: ${DATA_DIR}`);
 
 const DB_FILE = path.join(DATA_DIR, "notas.json");
 
@@ -50,10 +46,10 @@ if (R2_ENABLED) {
   }, 24 * 60 * 60 * 1000);
 }
 
-// Ensure folders exist (Critical for new locations)
-for (const dir of [DATA_DIR, UPLOADS_DIR]) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
+// Ensure folders exist (Critical)
+// fs.mkdirSync con recursive: true NO falla si ya existen
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 // ----- Migration: Local -> Persistent (Idempotent)
 // Se ejecuta solo si estamos en Render (Persistent) y detectamos archivos locales que no están en el disco
