@@ -18,7 +18,7 @@ const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
 
 // Detectar Persistent Disk de Render
-const RENDER_DISK_PATH = "/var/data/cobranza";
+const RENDER_DISK_PATH = "/var/data/cobranza-cha";
 // Usamos el disco solo si existe físicamente
 const USE_PERSISTENT = fs.existsSync(RENDER_DISK_PATH);
 
@@ -106,8 +106,10 @@ function loadDB() {
     return [];
   }
 }
+const { atomicWrite } = require("./utils/persistence");
+
 function saveDB(notas) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(notas, null, 2), "utf8");
+  atomicWrite(DB_FILE, notas);
 }
 
 // ----- Batch (martes 00:00)
