@@ -52,8 +52,10 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 // ----- Migration: Local -> Persistent (Idempotent)
-// Se ejecuta solo si estamos en Render (Persistent) y detectamos archivos locales que no están en el disco
-if (USE_PERSISTENT) {
+// Se ejecuta solo si DATA_DIR es distinto al path local por defecto (indicando uso de disco externo o custom)
+const IS_PERSISTENT_MODE = !!process.env.DATA_DIR;
+
+if (IS_PERSISTENT_MODE) {
   try {
     const localDataDir = path.join(ROOT, "data");
     const localUploadsDir = path.join(ROOT, "uploads");
