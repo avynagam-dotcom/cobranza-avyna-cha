@@ -755,6 +755,7 @@
     window.__allNotas = [];
     window.__batchKey = null;
     window.__viewMode = "batch"; // "batch" | "pendientes"
+    window.__reportActive = false;
 
     function setMsg(type, text) {
       msg.className = "msg " + (type || "");
@@ -782,11 +783,29 @@
       return Math.max(0, Math.round(diffMs / (24 * 60 * 60 * 1000)));
     }
 
-    function updateReportButton() {
+    async function updateReportButton() {
+      // 1. Check API status (is active?)
+      try {
+        const r = await fetch("/api/report-status");
+        const j = await r.json();
+        
+        if (j.ok && j.active) {
+            window.__reportActive = true;
+            reportBtn.disabled = false;
+            // Format remaining time
+            const mins = Math.ceil(j.remainingMs / 60000);
+            const hrs = Math.floor(mins / 60);
+            const m = mins % 60;
+            reportBtn.textContent = `Descargar Reporte (${hrs}h ${m}m)`;
+            return;
+        }
+      } catch (e) {}
+
+      window.__reportActive = false;
       const remaining = daysToEndOfMonth(new Date());
       if (remaining === 0) {
         reportBtn.disabled = false;
-        reportBtn.textContent = "Reporte mensual";
+        reportBtn.textContent = "Cierre Mensual (Iniciar)";
       } else {
         reportBtn.disabled = true;
         reportBtn.textContent = `Reporte en ${remaining} día${remaining === 1 ? "" : "s"}`;
@@ -809,7 +828,10 @@
       }
 
       tbody.innerHTML = list.map(n => {
-        const client = escapeHtml(n.cliente || n.originalName || n.filename || "—");
+        const clientRaw = n.cliente || n.originalName || n.filename || "—";
+        // VIP Star
+        const client = (n.isVIP ? "⭐ " : "") + escapeHtml(clientRaw);
+        
         const total = money(n.total);
         const pagado = money(n.pagado || 0);
         const saldo = money(n.saldo);
@@ -821,7 +843,7 @@
           <div>
             <div class="statusPill ${st.clickable ? "clickable" : ""}" data-ent="${st.clickable ? n.id : ""}">
               <span class="sDot ${st.dot}"></span>
-              ${escapeHtml(st.text)}
+              ${client.includes("⭐") ? '<span style="color:#f0c85b; margin-right:4px;">★</span>' : ''}${escapeHtml(st.text)}
             </div>
             ${due ? `<div class="statusHint">Vence: ${escapeHtml(due)}</div>` : (st.clickable ? `<div class="statusHint">Click para marcar entregado</div>` : ``)}
           </div>
@@ -1019,7 +1041,8 @@
           deliveredAt: n.deliveredAt || null,
           dueAt: n.dueAt || null,
           statusCredito: n.statusCredito || null,
-          uploadedAt: n.uploadedAt || null
+          uploadedAt: n.uploadedAt || null,
+          isVIP: n.isVIP || false
         }));
 
         window.__allNotas = notas;
@@ -1033,7 +1056,7 @@
 
         applyFilter();
         await refreshKPIs();
-        updateReportButton();
+        await updateReportButton();
         updateBackBatchButton();
       } catch (e) {
         // si falla fetch, no rompas UI
@@ -1188,10 +1211,28 @@
       fileInput.value = "";
     });
 
-    // Report button (solo UI por ahora)
-    reportBtn.addEventListener("click", () => {
+    // Report button interaction
+    reportBtn.addEventListener("click", async () => {
       if (reportBtn.disabled) return;
-      setMsg("ok", "Reporte mensual: listo para generar (fin de mes).");
+      
+      if (window.__reportActive) {
+         // Download directly if active
+         window.open("/api/report-pdf", "_blank");
+      } else {
+         // Activate first
+         try {
+            const r = await fetch("/api/report-start", { method: "POST" });
+            const j = await r.json();
+            if (j.ok) {
+               setMsg("ok", "Reporte activado por 6 horas.");
+               await updateReportButton(); // Refresh state
+               // Auto trigger download
+               window.open("/api/report-pdf", "_blank");
+            }
+         } catch(e) {
+            setMsg("err", "Error al iniciar reporte.");
+         }
+      }
     });
 
     // REFRESH “REAL” EN iPHONE:
@@ -1207,12 +1248,15 @@
     window.addEventListener("focus", () => refreshList());
 
     setInterval(() => {
-      if (isVisible()) refreshList();
+      if (isVisible()) {
+        refreshList();
+        // Also update report timer if active
+        if (window.__reportActive) updateReportButton();
+      }
     }, 15000);
 
     // Init
-    updateReportButton();
-    refreshList();
+    refreshList(); // Will call updateReportButton inside
   </script>
 </body>
 

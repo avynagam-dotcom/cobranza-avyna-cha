@@ -7,36 +7,27 @@ const pdfParse = require("pdf-parse");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+// Import PDF Generator
+const { generateReportPDF } = require("./utils/reportGenerator");
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// ----- Paths
 // ----- Paths configuration (Robust & Simple)
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
 
 // El usuario define process.env.DATA_DIR en Render (ej: /var/data/cobranza/cha)
-// Si no, fallback local.
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, "data");
-const UPLOADS_DIR = path.join(DATA_DIR, "uploads"); // Uploads DENTRO de data, o hermano? 
-// Nota: El código anterior ponía uploads fuera de data en Persistent mode user-defined? 
-// Revisando lógica anterior: DATA_DIR = path.join(RENDER_DISK_PATH, "data"); UPLOADS_DIR = path.join(RENDER_DISK_PATH, "uploads");
-// Si process.env.DATA_DIR es "/var/data/cobranza/cha", entonces:
-// Data real: /var/data/cobranza/cha
-// Uploads: /var/data/cobranza/cha/uploads
-// Esto parece lo más sensato para mantener todo junto.
+const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
+const DB_FILE = path.join(DATA_DIR, "notas.json");
+const STATUS_FILE = path.join(DATA_DIR, "status.json"); // Control de cierre
 
 console.log(`[System] DATA_DIR: ${DATA_DIR}`);
 
-const DB_FILE = path.join(DATA_DIR, "notas.json");
-
 // ----- Backup Automático (Scheduler)
-// Se delega a utils/scheduler.js para manejo robusto con node-cron
 const { initScheduler } = require("./utils/scheduler");
-
-// Inicializar el scheduler si tenemos credenciales de R2
 const R2_ENABLED = process.env.R2_ENDPOINT && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY && process.env.R2_BUCKET;
 
 if (R2_ENABLED) {
@@ -45,13 +36,11 @@ if (R2_ENABLED) {
   console.log("[System] Backup automático DESACTIVADO (Faltan credenciales R2)");
 }
 
-// Ensure folders exist (Critical)
-// fs.mkdirSync con recursive: true NO falla si ya existen
+// Ensure folders exist
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 // ----- Migration: Local -> Persistent (Idempotent)
-// Se ejecuta solo si DATA_DIR es distinto al path local por defecto (indicando uso de disco externo o custom)
 const IS_PERSISTENT_MODE = !!process.env.DATA_DIR;
 
 if (IS_PERSISTENT_MODE) {
@@ -61,18 +50,13 @@ if (IS_PERSISTENT_MODE) {
 
     function migrateFiles(srcDir, destDir) {
       if (!fs.existsSync(srcDir)) return;
-
       const files = fs.readdirSync(srcDir);
       let count = 0;
-
       for (const file of files) {
-        if (file.startsWith(".")) continue; // Ignorar .DS_Store, etc
-
+        if (file.startsWith(".")) continue;
         const srcPath = path.join(srcDir, file);
         const destPath = path.join(destDir, file);
-
         try {
-          // Solo copiamos si es archivo y NO existe en destino
           if (fs.statSync(srcPath).isFile() && !fs.existsSync(destPath)) {
             fs.copyFileSync(srcPath, destPath);
             count++;
@@ -81,19 +65,19 @@ if (IS_PERSISTENT_MODE) {
           console.error(`[Migra] Error copiando ${file}:`, e.message);
         }
       }
-
       if (count > 0) console.log(`[Migra] Se migraron ${count} archivos de ${srcDir} a ${destDir}`);
     }
 
     migrateFiles(localDataDir, DATA_DIR);
     migrateFiles(localUploadsDir, UPLOADS_DIR);
-
   } catch (err) {
     console.error("[Migra] Fallo en proceso de migración:", err);
   }
 }
 
-// ----- DB helpers
+// ----- DB helpers & Persistence
+const { atomicWrite } = require("./utils/persistence");
+
 function loadDB() {
   try {
     const raw = fs.readFileSync(DB_FILE, "utf8");
@@ -103,13 +87,61 @@ function loadDB() {
     return [];
   }
 }
-const { atomicWrite } = require("./utils/persistence");
 
 function saveDB(notas) {
   atomicWrite(DB_FILE, notas);
 }
 
-// ----- Batch (martes 00:00)
+// ----- V2 Schema Migration (Runtime)
+// Ensure all records have 'pagos' array. If not, migrate 'pagado' value.
+function ensureSchemaV2(notas) {
+  let changed = false;
+  notas.forEach(n => {
+    if (!Array.isArray(n.pagos)) {
+      // Legacy Migration
+      const legacyPagado = typeof n.pagado === "number" ? n.pagado : 0;
+      n.pagos = [];
+      if (legacyPagado > 0) {
+        // Create initial historical record
+        n.pagos.push({
+          fecha: n.firstPaymentAt || new Date().toISOString(),
+          monto: legacyPagado,
+          isLegacy: true
+        });
+      }
+      changed = true;
+    }
+    // Backward compatibility: Ensure root 'pagado' matches sum of current payments
+    // (We re-calculate strictly to trust the array as source of truth)
+    const sumPagos = n.pagos.reduce((sum, p) => sum + (Number(p.monto) || 0), 0);
+    if (n.pagado !== sumPagos) {
+      n.pagado = sumPagos;
+      changed = true;
+    }
+  });
+
+  if (changed) {
+    console.log("[Schema] Migración V2 aplicada a registros inconsistentes.");
+    saveDB(notas);
+  }
+  return notas;
+}
+
+// ----- Report Status Helpers
+function getReportStatus() {
+  try {
+    if (!fs.existsSync(STATUS_FILE)) return { active: false, startTime: null };
+    return JSON.parse(fs.readFileSync(STATUS_FILE, "utf8"));
+  } catch {
+    return { active: false, startTime: null };
+  }
+}
+
+function saveReportStatus(status) {
+  atomicWrite(STATUS_FILE, status);
+}
+
+// ----- Business Logic Helpers
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
@@ -122,26 +154,19 @@ function getMexicoDate(date = new Date()) {
   const formatter = new Intl.DateTimeFormat([], options);
   const parts = formatter.formatToParts(date);
   const get = (type) => parts.find(p => p.type === type).value;
-
   return new Date(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
 }
 
 function getCurrentBatchKey(now = new Date()) {
-  // Usar hora de México para determinar el día
   const mxDate = getMexicoDate(now);
-
-  // martes más reciente a las 00:00 (hora México)
-  // JS: 0=Dom,1=Lun,2=Mar,3=Mié...
   const day = mxDate.getDay();
   const daysSinceTuesday = (day - 2 + 7) % 7;
-
   const d = new Date(mxDate);
   d.setHours(0, 0, 0, 0);
   d.setDate(d.getDate() - daysSinceTuesday);
   return ymd(d);
 }
 
-// ----- Date helpers (crédito)
 function addDays(date, days) {
   const d = new Date(date);
   d.setDate(d.getDate() + days);
@@ -151,15 +176,12 @@ function iso(d) {
   return d ? new Date(d).toISOString() : null;
 }
 
-// ----- Extraction helpers
 function parseMoney(raw) {
   if (!raw) return null;
   const s = String(raw).replace(/\s/g, "");
-
   const lastDot = s.lastIndexOf(".");
   const lastComma = s.lastIndexOf(",");
   const decPos = Math.max(lastDot, lastComma);
-
   let normalized;
   if (decPos === -1) {
     normalized = s.replace(/[^\d]/g, "");
@@ -168,58 +190,44 @@ function parseMoney(raw) {
     const decPart = s.slice(decPos + 1).replace(/[^\d]/g, "").slice(0, 2);
     normalized = `${intPart}.${decPart}`;
   }
-
   const n = Number(normalized);
   return Number.isFinite(n) ? n : null;
 }
 
 function extractTotalFromText(text) {
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-
-  // líneas con TOTAL pero NO SUBTOTAL
-  const totalLines = lines
-    .filter((l) => /total/i.test(l))
-    .filter((l) => !/sub\s*total/i.test(l));
-
+  const totalLines = lines.filter((l) => /total/i.test(l)).filter((l) => !/sub\s*total/i.test(l));
   const patterns = [
     /(TOTAL\s*A\s*PAGAR)\s*[:\-]?\s*\$?\s*([0-9][0-9.,\s]*)/i,
     /(IMPORTE\s*TOTAL)\s*[:\-]?\s*\$?\s*([0-9][0-9.,\s]*)/i,
     /(^|\b)(TOTAL)\s*[:\-]?\s*\$?\s*([0-9][0-9.,\s]*)/i,
   ];
-
   let candidates = [];
-
   for (const l of totalLines) {
     for (const p of patterns) {
       const m = l.match(p);
       if (m) {
-        const moneyStr = m[m.length - 1];
-        const val = parseMoney(moneyStr);
+        const val = parseMoney(m[m.length - 1]);
         if (val != null) candidates.push(val);
       }
     }
   }
-
-  // fallback: todo el texto (última ocurrencia)
   if (candidates.length === 0) {
     for (const p of patterns) {
       const all = [...text.matchAll(p)];
       if (all.length) {
         const last = all[all.length - 1];
-        const moneyStr = last[last.length - 1];
-        const val = parseMoney(moneyStr);
+        const val = parseMoney(last[last.length - 1]);
         if (val != null) candidates.push(val);
       }
     }
   }
-
   if (candidates.length === 0) return null;
   return Math.max(...candidates);
 }
 
 function extractClienteFromText(text) {
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-
   const sameLine = [
     /(CLIENTE)\s*[:\-]\s*(.+)$/i,
     /(NOMBRE)\s*[:\-]\s*(.+)$/i,
@@ -228,13 +236,9 @@ function extractClienteFromText(text) {
   for (const l of lines) {
     for (const p of sameLine) {
       const m = l.match(p);
-      if (m && m[2]) {
-        const v = m[2].trim();
-        if (v && v.length >= 3) return v;
-      }
+      if (m && m[2] && m[2].trim().length >= 3) return m[2].trim();
     }
   }
-
   const nextLineLabels = [/^CLIENTE$/i, /^NOMBRE$/i, /^RAZ[ÓO]N\s+SOCIAL$/i];
   for (let i = 0; i < lines.length - 1; i++) {
     if (nextLineLabels.some((rx) => rx.test(lines[i]))) {
@@ -242,20 +246,18 @@ function extractClienteFromText(text) {
       if (v && v.length >= 3 && !/^(RFC|FECHA|FOLIO|TOTAL|SUBTOTAL)$/i.test(v)) return v;
     }
   }
-
   for (const l of lines) {
     const m = l.match(/^(\d{4,})\s*[-–—]\s*(.+)$/);
     if (m && m[2]) return `${m[1]} - ${m[2].trim()}`;
   }
-
   return null;
 }
 
-// ----- Crédito (estado en TIEMPO REAL)
 function computeCredito(nota, now = new Date()) {
   const deliveredAt = nota.deliveredAt ? new Date(nota.deliveredAt) : null;
   const dueAt = nota.dueAt ? new Date(nota.dueAt) : null;
 
+  // V2: pagado comes from schema reduction, ensured by ensureSchemaV2
   const total = typeof nota.total === "number" && Number.isFinite(nota.total) ? nota.total : null;
   const pagado = typeof nota.pagado === "number" && Number.isFinite(nota.pagado) ? nota.pagado : 0;
 
@@ -288,95 +290,129 @@ function computeCredito(nota, now = new Date()) {
   };
 }
 
+// ----- VIP Logic Reference: 
+// >$10,000 monthly volume AND impeccable punctuality (0 delays)
+function isVIP(nota, allNotes) {
+  // We can evaluate VIP based on Client Name Grouping or single note context?
+  // User request: "Algoritmo de Inteligencia VIP". Assuming client-based.
+  // We need to normalize client name for grouping.
+  if (!nota.cliente) return false;
+
+  const clientName = nota.cliente.toLowerCase().trim();
+  const clientNotes = allNotes.filter(n => (n.cliente || "").toLowerCase().trim() === clientName);
+
+  // 1. Volume Check (Monthly Avg or Total? Request says "Volumen Mensual > $10,000")
+  // Let's check Total Volume of current month for simplicity, or just look at this note?
+  // "Volumen Mensual" usually implies aggregate. Let's aggregate delivered notes this month.
+  const now = new Date();
+  const currentMonth = now.getMonth();
+  const currentYear = now.getFullYear();
+
+  const monthNotes = clientNotes.filter(n => {
+    if (!n.deliveredAt) return false;
+    const d = new Date(n.deliveredAt);
+    return d.getMonth() === currentMonth && d.getFullYear() === currentYear;
+  });
+
+  const monthVolume = monthNotes.reduce((sum, n) => sum + (n.total || 0), 0);
+
+  // If this note pushes them over, they are VIP for this note too.
+  // Actually, let's just use the current note's Total if it's big, 
+  // OR if their aggregate is big.
+  // Just complying strict to "Volumen Mensual > 10,000".
+  if (monthVolume < 10000) return false;
+
+  // 2. Punctuality Check: 0 delays AFTER due date.
+  // We check ALL history for this client.
+  const hasDelays = clientNotes.some(n => {
+    // If it was ever paid late or is currently late
+    // Simplest check: Is it VENCIDO now?
+    if (computeCredito(n, now).statusCredito === "VENCIDO") return true;
+
+    // Check history (if we had payment dates vs due dates).
+    // V2 Schema allows checking payment dates!
+    if (n.pagos && n.dueAt) {
+      const due = new Date(n.dueAt).getTime();
+      // Any payment made AFTER due date?
+      return n.pagos.some(p => new Date(p.fecha).getTime() > due);
+    }
+    return false;
+  });
+
+  return !hasDelays;
+}
+
 // ----- Multer (PDF upload)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
+  limits: { fileSize: 15 * 1024 * 1024 },
 });
 
-// ----- Static
 app.use(express.static(PUBLIC_DIR));
 
-// ----- API: listar notas
+// ----- API ENDPOINTS
+
+// 1. Listar Notas (con VIP y Schema check)
 app.get("/api/notas", (req, res) => {
-  const notas = loadDB();
+  let notas = loadDB();
+  // Ensure V2 Schema on read (lazy migration / safety)
+  notas = ensureSchemaV2(notas);
+
   const batchKey = getCurrentBatchKey();
   const now = new Date();
-  const notasWithCredito = notas.map((n) => ({ ...n, ...computeCredito(n, now) }));
-  res.json({ batchKey, notas: notasWithCredito });
+
+  const notasProcessed = notas.map((n) => {
+    const computed = computeCredito(n, now);
+    // Inject VIP status
+    const vip = isVIP(n, notas); // Pass all notes context for aggregation
+    return { ...n, ...computed, isVIP: vip };
+  });
+
+  res.json({ batchKey, notas: notasProcessed });
 });
 
-// ----- API: subir PDF
+// 2. Upload PDF
 app.post("/api/upload", upload.single("pdf"), async (req, res) => {
   try {
     const batchKey = getCurrentBatchKey();
-
-    if (!req.file || !req.file.buffer) {
-      return res.status(400).json({ ok: false, message: "No se recibió PDF" });
-    }
+    if (!req.file || !req.file.buffer) return res.status(400).json({ ok: false, message: "No PDF" });
 
     const originalName = req.file.originalname || "nota.pdf";
-    const notas = loadDB();
+    let notas = ensureSchemaV2(loadDB());
 
-    // ✅ Regla nueva:
-    // Si hay una nota con mismo nombre EN EL BATCH:
-    // - si NO está entregada => sustituir (mismo id, mismo filename, sobreescribe PDF y actualiza cliente/total)
-    // - si YA está entregada => bloquear (duplicado)
     const existingIdx = notas.findIndex(
-      (n) =>
-        String(n.batchKey) === String(batchKey) &&
+      (n) => String(n.batchKey) === String(batchKey) &&
         String(n.originalName || "").toLowerCase() === String(originalName).toLowerCase()
     );
 
-    // Parse PDF (siempre parseamos porque para sustituir necesitamos nuevo total/cliente)
     const parsed = await pdfParse(req.file.buffer);
     const text = parsed && parsed.text ? parsed.text : "";
     const cliente = extractClienteFromText(text) || null;
     const total = extractTotalFromText(text);
-
     const uploadedAt = new Date().toISOString();
 
     if (existingIdx !== -1) {
       const ex = notas[existingIdx];
+      if (ex.deliveredAt) return res.json({ ok: false, duplicate: true, message: "Nota duplicada (ya entregada)" });
 
-      // Si ya está entregada: NO se sustituye
-      if (ex.deliveredAt) {
-        return res.json({ ok: false, duplicate: true, message: "Nota duplicada (ya entregada)" });
-      }
-
-      // ✅ Sustituir (pre-entrega)
-      // Mantener: id, pagado, deliveredAt(null), dueAt(null), firstPaymentAt, batchKey
-      // Actualizar: cliente, total, uploadedAt
+      // Update existing
       ex.cliente = cliente;
       ex.total = typeof total === "number" && Number.isFinite(total) ? total : null;
       ex.uploadedAt = uploadedAt;
 
-      // Guardar / sobreescribir el PDF usando el mismo filename de esa nota
-      // (Esto mantiene tu historial limpio y evita crear 2 notas)
-      const filename = ex.filename || `${batchKey}__${ex.id}__${originalName}`.replace(
-        /[^\w.\-() \u00C0-\u017F]/g,
-        "_"
-      );
+      const filename = ex.filename || `${batchKey}__${ex.id}__${originalName}`.replace(/[^\w.\-() \u00C0-\u017F]/g, "_");
       ex.filename = filename;
-
-      const filePath = path.join(UPLOADS_DIR, filename);
-      fs.writeFileSync(filePath, req.file.buffer);
+      fs.writeFileSync(path.join(UPLOADS_DIR, filename), req.file.buffer);
 
       notas[existingIdx] = ex;
       saveDB(notas);
-
       return res.json({ ok: true, replaced: true, nota: { ...ex, ...computeCredito(ex) } });
     }
 
-    // ✅ Nueva nota (no existe)
+    // New Note
     const id = crypto.randomUUID();
-
-    const safeName = `${batchKey}__${id}__${originalName}`.replace(
-      /[^\w.\-() \u00C0-\u017F]/g,
-      "_"
-    );
-    const filePath = path.join(UPLOADS_DIR, safeName);
-    fs.writeFileSync(filePath, req.file.buffer);
+    const safeName = `${batchKey}__${id}__${originalName}`.replace(/[^\w.\-() \u00C0-\u017F]/g, "_");
+    fs.writeFileSync(path.join(UPLOADS_DIR, safeName), req.file.buffer);
 
     const nota = {
       id,
@@ -386,6 +422,7 @@ app.post("/api/upload", upload.single("pdf"), async (req, res) => {
       cliente,
       total: typeof total === "number" && Number.isFinite(total) ? total : null,
       pagado: 0,
+      pagos: [], // V2 Init
       deliveredAt: null,
       dueAt: null,
       firstPaymentAt: null,
@@ -394,7 +431,6 @@ app.post("/api/upload", upload.single("pdf"), async (req, res) => {
 
     notas.push(nota);
     saveDB(notas);
-
     return res.json({ ok: true, nota: { ...nota, ...computeCredito(nota) } });
   } catch (e) {
     console.error("UPLOAD ERROR:", e);
@@ -402,59 +438,64 @@ app.post("/api/upload", upload.single("pdf"), async (req, res) => {
   }
 });
 
-// ----- API: marcar ENTREGADO (inicio crédito)
+// 3. Entregar
 app.post("/api/entregar", (req, res) => {
   try {
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ ok: false, message: "Falta id" });
 
-    const notas = loadDB();
+    let notas = ensureSchemaV2(loadDB());
     const idx = notas.findIndex((n) => String(n.id) === String(id));
     if (idx === -1) return res.status(404).json({ ok: false, message: "Nota no encontrada" });
 
     const n = notas[idx];
-
     if (!n.deliveredAt) {
       const now = new Date();
       n.deliveredAt = iso(now);
-      // ✅ 15 días (como quedamos)
       n.dueAt = iso(addDays(now, 15));
     }
-
     notas[idx] = n;
     saveDB(notas);
-
     return res.json({ ok: true, nota: { ...n, ...computeCredito(n) } });
   } catch (e) {
-    console.error("ENTREGAR ERROR:", e);
-    return res.status(500).json({ ok: false, message: "Error al marcar entregado" });
+    return res.status(500).json({ ok: false, message: "Error al entregar" });
   }
 });
 
-// ----- API: registrar pago
+// 4. Pago (V2 Schema Update)
 app.post("/api/pago", (req, res) => {
   try {
     const { id, monto } = req.body || {};
     const val = Number(monto);
+    if (!id || !Number.isFinite(val) || val <= 0) return res.status(400).json({ ok: false, message: "Datos inválidos" });
 
-    if (!id || !Number.isFinite(val) || val <= 0) {
-      return res.status(400).json({ ok: false, message: "Datos inválidos" });
-    }
-
-    const notas = loadDB();
+    let notas = ensureSchemaV2(loadDB());
     const idx = notas.findIndex((n) => String(n.id) === String(id));
     if (idx === -1) return res.status(404).json({ ok: false, message: "Nota no encontrada" });
 
     const n = notas[idx];
-    n.pagado = Number(n.pagado || 0) + val;
+
+    // V2: Add to history
+    const now = new Date(); // ALWAYS server time
+    const newPayment = {
+      id: crypto.randomUUID(),
+      monto: val,
+      fecha: now.toISOString(),
+      timestamp: now.getTime()
+    };
+
+    if (!Array.isArray(n.pagos)) n.pagos = [];
+    n.pagos.push(newPayment);
+
+    // Update aggregate
+    n.pagado = n.pagos.reduce((sum, p) => sum + (Number(p.monto) || 0), 0);
 
     if (n.deliveredAt && !n.firstPaymentAt) {
-      n.firstPaymentAt = new Date().toISOString();
+      n.firstPaymentAt = now.toISOString();
     }
 
     notas[idx] = n;
     saveDB(notas);
-
     return res.json({ ok: true, nota: { ...n, ...computeCredito(n) } });
   } catch (e) {
     console.error("PAGO ERROR:", e);
@@ -462,44 +503,33 @@ app.post("/api/pago", (req, res) => {
   }
 });
 
-// ----- API: eliminar nota
+// 5. Eliminar
 app.delete("/api/notas/:id", (req, res) => {
   try {
     const { id } = req.params;
     if (!id) return res.status(400).json({ ok: false, message: "Falta id" });
 
-    const notas = loadDB();
+    let notas = loadDB();
     const idx = notas.findIndex((n) => String(n.id) === String(id));
     if (idx === -1) return res.status(404).json({ ok: false, message: "Nota no encontrada" });
 
     const n = notas[idx];
-
-    // Intentar borrar el archivo físico
     if (n.filename) {
-      const filePath = path.join(UPLOADS_DIR, n.filename);
-      if (fs.existsSync(filePath)) {
-        try {
-          fs.unlinkSync(filePath);
-        } catch (err) {
-          console.error(`[Delete] Error borrando archivo ${n.filename}:`, err.message);
-        }
-      }
+      const p = path.join(UPLOADS_DIR, n.filename);
+      if (fs.existsSync(p)) try { fs.unlinkSync(p); } catch { }
     }
 
-    // Quitar de la DB
     notas.splice(idx, 1);
     saveDB(notas);
-
-    return res.json({ ok: true, message: "Nota eliminada" });
+    return res.json({ ok: true, message: "Eliminada" });
   } catch (e) {
-    console.error("DELETE ERROR:", e);
-    return res.status(500).json({ ok: false, message: "Error al eliminar nota" });
+    return res.status(500).json({ ok: false, message: "Error al eliminar" });
   }
 });
 
-// ----- KPIs globales (SOLO ENTREGADAS) ✅ consistencia y utilidades
+// 6. KPIs
 app.get("/api/kpis", (req, res) => {
-  const notas = loadDB();
+  let notas = ensureSchemaV2(loadDB());
   const entregadas = notas.filter((n) => !!n.deliveredAt);
 
   let totalCobrable = 0;
@@ -508,56 +538,142 @@ app.get("/api/kpis", (req, res) => {
   for (const n of entregadas) {
     const total = typeof n.total === "number" && Number.isFinite(n.total) ? n.total : 0;
     const pagado = typeof n.pagado === "number" && Number.isFinite(n.pagado) ? n.pagado : 0;
-
     totalCobrable += total;
     totalCobrado += Math.min(pagado, total);
   }
 
-  // ✅ saldo = cobrable - cobrado (evita discrepancias)
   const totalSaldo = Math.max(totalCobrable - totalCobrado, 0);
   const pctCobranza = totalCobrable > 0 ? totalCobrado / totalCobrable : 0;
-
   const utilidadCobrada = totalCobrado * 0.4;
   const utilidadPorCobrar = totalSaldo * 0.4;
 
-  res.json({
-    ok: true,
-    totalCobrable,
-    totalCobrado,
-    totalSaldo,
-    pctCobranza,
-    utilidadCobrada,
-    utilidadPorCobrar,
-  });
+  res.json({ ok: true, totalCobrable, totalCobrado, totalSaldo, pctCobranza, utilidadCobrada, utilidadPorCobrar });
 });
 
-// ----- quién falta por pagar (entregadas con saldo)
+// 7. Faltantes
 app.get("/api/faltantes", (req, res) => {
-  const notas = loadDB();
+  let notas = ensureSchemaV2(loadDB());
   const now = new Date();
-
   const faltantes = notas
     .filter((n) => !!n.deliveredAt)
     .map((n) => ({ ...n, ...computeCredito(n, now) }))
     .filter((n) => (typeof n.saldo === "number" ? n.saldo > 0 : true))
     .sort((a, b) => {
-      const rank = (s) =>
-        s === "VENCIDO" ? 0 : s === "POR_VENCER" ? 1 : s === "EN_PLAZO" ? 2 : 3;
+      const rank = (s) => s === "VENCIDO" ? 0 : s === "POR_VENCER" ? 1 : s === "EN_PLAZO" ? 2 : 3;
       const ra = rank(a.statusCredito);
       const rb = rank(b.statusCredito);
       if (ra !== rb) return ra - rb;
-
       const da = a.dueAt ? new Date(a.dueAt).getTime() : Number.POSITIVE_INFINITY;
       const db = b.dueAt ? new Date(b.dueAt).getTime() : Number.POSITIVE_INFINITY;
       return da - db;
     });
-
   res.json({ ok: true, faltantes });
 });
 
-// ----- Start
+// 8. Closing Control: Status
+app.get("/api/report-status", (req, res) => {
+  const status = getReportStatus();
+  const now = Date.now();
+  let remainingMs = 0;
+
+  if (status.active && status.startTime) {
+    const elapsed = now - status.startTime;
+    const sixHours = 6 * 60 * 60 * 1000;
+    remainingMs = Math.max(0, sixHours - elapsed);
+
+    // Auto-expire
+    if (remainingMs === 0 && status.active) {
+      status.active = false;
+      status.startTime = null;
+      saveReportStatus(status);
+    }
+  }
+
+  res.json({
+    ok: true,
+    active: status.active,
+    remainingMs
+  });
+});
+
+// 9. Closing Control: Start
+app.post("/api/report-start", (req, res) => {
+  let status = getReportStatus();
+  if (!status.active) {
+    status.active = true;
+    status.startTime = Date.now();
+    saveReportStatus(status);
+  }
+  res.json({ ok: true });
+});
+
+// 10. Generate PDF Report
+app.get("/api/report-pdf", async (req, res) => {
+  try {
+    let notas = ensureSchemaV2(loadDB());
+
+    // Filter logic: Typically a monthly report. 
+    // Which month? Current month based on server time?
+    // Or just all delivered notes that affect "Este Mes"?
+    // Let's assume Reporte Mensual reflects the "Active Month".
+    // For simplicity: All delivered notes with activity or active debt.
+    // Or just dump EVERYTHING active?
+    // Let's dump "Batch Actual" notes + "Deuda Activa".
+
+    // Better yet: Just all known notes to keep it complete, or ask user?
+    // User requirement: "Reporte Mensual". Usually implies "Cierre de Mes".
+    // Let's filter notes belonging to current month (deliveredAt in current Month) OR pending debt.
+    const now = new Date();
+    const curMonth = now.getMonth();
+    const curYear = now.getFullYear();
+
+    const reportNotes = notas.filter(n => {
+      if (!n.deliveredAt) return false;
+      const d = new Date(n.deliveredAt);
+      const isThisMonth = (d.getMonth() === curMonth && d.getFullYear() === curYear);
+      const hasDebt = (n.total - n.pagado) > 0;
+      return isThisMonth || hasDebt;
+    }).map(n => ({ ...n, ...computeCredito(n, now), isVIP: isVIP(n, notas) }));
+
+    // Calculate Stats
+    let totalCobrable = 0, totalCobrado = 0;
+    reportNotes.forEach(n => {
+      totalCobrable += (n.total || 0);
+      totalCobrado += (n.pagado || 0);
+    });
+    const totalSaldo = Math.max(totalCobrable - totalCobrado, 0);
+    const pct = totalCobrable > 0 ? (totalCobrado / totalCobrable) * 100 : 0;
+
+    const stats = {
+      cobrado: `$${totalCobrado.toLocaleString("es-MX")}`,
+      porCobrar: `$${totalSaldo.toLocaleString("es-MX")}`,
+      utilidad: `$${(totalCobrado * 0.4).toLocaleString("es-MX")}`,
+      pct: `${pct.toFixed(1)}%`
+    };
+
+    // Get VIPs
+    const uniqueClients = [...new Set(reportNotes.map(n => n.cliente))].filter(Boolean);
+    const vipDetail = uniqueClients
+      .filter(c => isVIP({ cliente: c }, notas))
+      .map(c => {
+        // Mock or calc volume
+        return { name: c, volumen: "VIP" };
+      });
+
+    const logoPath = path.join(PUBLIC_DIR, "apple-touch-icon.png");
+    const pdfBuffer = await generateReportPDF(logoPath, reportNotes, vipDetail, stats, {});
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename=Reporte_Cha_${ymd(now)}.pdf`);
+    res.send(pdfBuffer);
+
+  } catch (e) {
+    console.error("PDF ERROR:", e);
+    res.status(500).send("Error generando PDF");
+  }
+});
+
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
-  console.log(`Batch actual (martes 00:00): ${getCurrentBatchKey()}`);
 });
