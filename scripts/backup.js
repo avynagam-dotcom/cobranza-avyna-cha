@@ -10,19 +10,14 @@ async function runBackup() {
     console.log("  Iniciando Protocolo de Respaldo (CHA)");
     console.log("========================================");
 
-    const SYSTEM_NAME = process.env.SYSTEM_NAME || "avyna-cha";
     const R2_ENDPOINT = process.env.R2_ENDPOINT;
     const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
     const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
     const R2_BUCKET = process.env.R2_BUCKET;
 
-    // Configuration via Environment (Defaults matching server.js logic)
+    // Configuration via Environment
     // El usuario define process.env.DATA_DIR (ej: /var/data/cobranza/cha)
     const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "..", "data");
-
-    // Uploads está dentro o hermano? En server.js definimos: UPLOADS_DIR = path.join(DATA_DIR, "uploads")
-    // Pero si DATA_DIR es .../cha, server.js hace Data: .../cha (DB_FILE) y Uploads: .../cha/uploads
-    // Ajustemos backup para que busque ahí.
     const SOURCE_DIR = DATA_DIR;
 
     if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
@@ -30,13 +25,11 @@ async function runBackup() {
     }
 
     const date = new Date().toISOString().split("T")[0];
-    const filename = `backup-${date}.tar.gz`; // Quitamos 'cha-' del nombre, lo pondremos en carpeta
+    const filename = `backup-${date}.tar.gz`;
     const archivePath = path.join("/tmp", filename);
 
     try {
         console.log(`\n🔍 Verificando origen en: ${SOURCE_DIR}`);
-        // server.js pone notas.json en raíz de DATA_DIR y uploads en DATA_DIR/uploads.
-        // Así que respaldaremos todo el SOURCE_DIR.
 
         if (!fs.existsSync(SOURCE_DIR)) {
             console.warn(`⚠️ ALERTA: No existe el directorio origen: ${SOURCE_DIR}`);
@@ -44,7 +37,6 @@ async function runBackup() {
         }
 
         console.log(`\n📦 Comprimiendo contenido de ${SOURCE_DIR} en ${archivePath}...`);
-        // Tar de todo el contenido de DATA_DIR (.)
         execSync(`tar -czf ${archivePath} .`, { cwd: SOURCE_DIR });
 
         const sizeBytes = fs.statSync(archivePath).size;
@@ -62,7 +54,7 @@ async function runBackup() {
         });
 
         const fileBuffer = fs.readFileSync(archivePath);
-        // Prefijo solicitado: "cha/..."
+        // Namespace específico: cha/
         const s3Key = `cha/${filename}`;
 
         await s3.send(new PutObjectCommand({
@@ -82,7 +74,6 @@ async function runBackup() {
     } catch (error) {
         console.error("\n❌ ERROR CRÍTICO DURANTE EL RESPALDO:");
         console.error(error.message);
-        // Si falló, intentamos borrar el temporal si existe
         if (fs.existsSync(archivePath)) {
             try { fs.unlinkSync(archivePath); } catch (e) { }
         }
